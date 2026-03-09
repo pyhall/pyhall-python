@@ -326,18 +326,17 @@ pyhall/
   telemetry.py     — mandatory telemetry event builders
   conformance.py   — conformance validation for CI
   common.py        — shared utilities (timestamps, response envelopes)
-  cli.py           — pyhall CLI (route, validate, status, enroll, scaffold)
   attestation.py   — PackageAttestationVerifier, build_manifest, write_manifest,
                      scaffold_package, canonical_package_hash, ATTEST_* deny codes
   registry_client.py — RegistryClient (HTTP client for api.pyhall.dev)
 
 workers/examples/
-  hello_worker/    — minimal complete worker (start here)
+  README.md        — examples moved to github.com/pyhall/pyhall-examples
 
 tests/
   test_router.py   — WCP compliance test suite
 
-WCP spec           — see https://github.com/fafolab/wcp
+WCP spec           — see https://github.com/workerclassprotocol/wcp
 ```
 
 ## License
