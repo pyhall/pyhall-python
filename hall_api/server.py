@@ -28,6 +28,8 @@ import hashlib
 import json
 import os
 import sqlite3
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, UTC
 
@@ -40,6 +42,51 @@ from pyhall.registry_client import RegistryClient, RegistryRateLimitError
 
 HALL_VERSION = "0.1.0"
 DB_PATH = os.environ.get("HALL_DB_PATH", "hall.db")
+
+# ---------------------------------------------------------------------------
+# Server state — shared across all requests
+# ---------------------------------------------------------------------------
+
+_server_state: dict = {
+    'online': False,
+    'account_standing': None,   # 'ok' | 'grace' | 'degraded' | 'suspended' | None
+    'standing_checked_at': None,
+    'standing_tier_id': None,
+    'standing_github_login': None,
+}
+
+
+# ---------------------------------------------------------------------------
+# Standing helpers
+# ---------------------------------------------------------------------------
+
+def _check_standing(registry_url: str, session_token: str | None, bearer_token: str | None) -> dict:
+    """
+    Call GET /api/account/standing on the registry.
+    Returns { 'standing': str, 'tier_id': str, 'github_login': str, 'checked_at': str }
+    or raises urllib.error.HTTPError on failure.
+    """
+    url = f"{registry_url}/api/account/standing"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    if bearer_token:
+        req.add_header("Authorization", f"Bearer {bearer_token}")
+    elif session_token:
+        req.add_header("Cookie", f"pyhall_session={session_token}")
+
+    with urllib.request.urlopen(req) as resp:
+        body = json.loads(resp.read().decode())
+
+    return {
+        "standing": body.get("standing", "degraded"),
+        "tier_id": body.get("tier_id"),
+        "github_login": body.get("github_login"),
+        "checked_at": body.get("checked_at"),
+    }
+
+
+def _standing_allows_online(standing: str) -> bool:
+    """ok and grace allow online. degraded and suspended block it."""
+    return standing in ('ok', 'grace')
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +234,9 @@ def create_app(testing: bool = False, db_path: str | None = None) -> Flask:
             "decisions_today": decisions_today,
             "denials_today": denials_today,
             "timestamp": datetime.now(UTC).isoformat(),
+            "online": _server_state['online'],
+            "account_standing": _server_state['account_standing'],
+            "standing_checked_at": _server_state['standing_checked_at'],
         })
 
     # ---------------------------------------------------------------------------
@@ -222,7 +272,10 @@ def create_app(testing: bool = False, db_path: str | None = None) -> Flask:
     @app.route("/dispatches")
     def dispatches():
         db = g.db
-        limit = min(int(request.args.get("limit", 50)), 200)
+        try:
+            limit = min(max(1, int(request.args.get("limit", 50))), 200)
+        except (ValueError, TypeError):
+            return jsonify({"error": "limit must be an integer"}), 400
         rows = db.execute(
             "SELECT * FROM decisions ORDER BY decided_at DESC LIMIT ?", (limit,)
         ).fetchall()
@@ -283,8 +336,6 @@ def create_app(testing: bool = False, db_path: str | None = None) -> Flask:
         if not valid:
             return jsonify({
                 "error": "artifact_hash mismatch — record was tampered",
-                "provided": provided_hash,
-                "expected": expected,
                 "code": "DENY_WORKER_TAMPERED",
             }), 400
 
@@ -375,6 +426,62 @@ def create_app(testing: bool = False, db_path: str | None = None) -> Flask:
             return jsonify({"error": str(e)}), 500
 
         return jsonify({"recorded": True, "decision_id": decision_id}), 201
+
+    # ---------------------------------------------------------------------------
+    # POST /api/server/go-online
+    # ---------------------------------------------------------------------------
+
+    @app.route("/api/server/go-online", methods=["POST", "OPTIONS"])
+    def go_online():
+        if request.method == "OPTIONS":
+            return jsonify({}), 204
+
+        # Get auth from request header (desktop sends Bearer token)
+        bearer = request.headers.get('Authorization', '').removeprefix('Bearer ').strip() or None
+        session = request.cookies.get('pyhall_session') or None
+
+        registry_url = os.environ.get('PYHALL_REGISTRY_URL', 'https://api.pyhall.dev')
+
+        try:
+            result = _check_standing(registry_url, session, bearer)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                return jsonify({'ok': False, 'message': 'Not authenticated with registry.'}), 401
+            return jsonify({'ok': False, 'message': f'Registry error: {exc.code}'}), 502
+        except Exception as exc:
+            return jsonify({'ok': False, 'message': f'Registry unreachable: {exc}'}), 503
+
+        standing = result.get('standing', 'degraded')
+        _server_state['account_standing'] = standing
+        _server_state['standing_checked_at'] = result.get('checked_at')
+        _server_state['standing_tier_id'] = result.get('tier_id')
+        _server_state['standing_github_login'] = result.get('github_login')
+
+        if not _standing_allows_online(standing):
+            _server_state['online'] = False
+            return jsonify({
+                'ok': False,
+                'message': f'Account standing is {standing!r}. Cannot go online.',
+                'account_standing': standing,
+            }), 403
+
+        _server_state['online'] = True
+        return jsonify({
+            'ok': True,
+            'account_standing': standing,
+            'tier_id': result.get('tier_id'),
+        })
+
+    # ---------------------------------------------------------------------------
+    # POST /api/server/go-offline
+    # ---------------------------------------------------------------------------
+
+    @app.route("/api/server/go-offline", methods=["POST", "OPTIONS"])
+    def go_offline():
+        if request.method == "OPTIONS":
+            return jsonify({}), 204
+        _server_state['online'] = False
+        return jsonify({'ok': True})
 
     # ── Registry proxy (public endpoints, no auth required) ──────────────────
 
